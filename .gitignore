@@ -1,0 +1,40 @@
+# секреты и локальная конфигурация
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+
+# node
+node_modules/
+.vite/
+
+# модели и офлайн-бандлы — большие, не в git
+models/
+*.gguf
+*.safetensors
+offline-bundle/
+*.tar
+
+# данные, документы заказчиков, результаты замеров
+data/
+corpus/
+bench-results/
+
+# инструменты
+.DS_Store
+.idea/
+.vscode/
