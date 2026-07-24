@@ -5,7 +5,7 @@ description = "Домен Станка: workflow, tools, policy, approvals, audi
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.7",
-    "jsonschema>=4.22",
+    "jsonschema[format-nongpl]>=4.22",
 ]
 
 [build-system]

@@ -92,6 +92,13 @@ class ValidatedToolCall(ContractModel):
     arguments: JsonObject
 
 
+class CallRejected(ContractModel):
+    """A proposal rejected before dispatch; detail is bounded, value-free (no raw args)."""
+
+    reason: Literal["unknown_tool", "tool_unavailable", "invalid_arguments", "forbidden"]
+    detail: ShortText
+
+
 class ToolError(ContractModel):
     """Structured error, safe for the audit log and for the model.
     No raw exception text and no document content (AD-7, AD-8)."""
