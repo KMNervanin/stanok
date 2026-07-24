@@ -167,9 +167,14 @@ def _check_object(node: Mapping[str, Any], path: str, def_names: set[str]) -> No
     required = node.get("required", [])
     if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
         raise ToolSchemaError(f"{path}.required: must be a list of strings")
-    missing = set(required) - set(props)
-    if missing:
-        raise ToolSchemaError(f"{path}.required: names absent from properties: {sorted(missing)}")
+    # Every property must be required. An optional property (default / default_factory) would let
+    # a missing argument be silently masked; nullable is expressed as `T | None`, still required.
+    if set(required) != set(props):
+        optional = sorted(set(props) - set(required))
+        unknown = sorted(set(required) - set(props))
+        raise ToolSchemaError(
+            f"{path}: every property must be required; optional: {optional}, unknown: {unknown}"
+        )
 
 
 def _check_ref(node: Mapping[str, Any], path: str, keys: set[str], def_names: set[str]) -> None:
