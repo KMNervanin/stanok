@@ -1,0 +1,19 @@
+[project]
+name = "stanok-conformance"
+version = "0.0.0"
+description = "Conformance-набор для контракта tool-calling: кейсы + минимальный runner на один backend."
+requires-python = ">=3.12"
+dependencies = [
+    "stanok-core",
+    "pydantic>=2.7",
+]
+
+[tool.uv.sources]
+stanok-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stanok_conformance"]
