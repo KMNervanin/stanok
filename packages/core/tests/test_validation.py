@@ -30,6 +30,37 @@ def test_valid_proposal_becomes_validated_call() -> None:
     assert isinstance(out.call_id, UUID)
 
 
+def test_validated_payload_is_immutable() -> None:
+    # K1: mutating the returned dict must not alter the trusted snapshot executed later
+    reg, offered = _setup()
+    proposal = ToolCallProposal(tool="search_client", arguments={"inn": "7700000000"})
+    out = validate_proposal(proposal, offered, reg, _GRANTED)
+    assert isinstance(out, ValidatedToolCall)
+    out.arguments["inn"] = "MUTATED"
+    out.arguments["injected"] = "x"
+    assert out.arguments == {"inn": "7700000000"}  # snapshot unchanged
+
+
+def test_validated_payload_detached_from_proposal() -> None:
+    # the snapshot is taken from canonical bytes, independent of the (mutable) proposal object
+    reg, offered = _setup()
+    args = {"inn": "7700000000"}
+    proposal = ToolCallProposal(tool="search_client", arguments=args)
+    out = validate_proposal(proposal, offered, reg, _GRANTED)
+    assert isinstance(out, ValidatedToolCall)
+    assert out.arguments_json == b'{"inn":"7700000000"}'
+
+
+def test_rejects_overcomplex_arguments() -> None:
+    # a small-bytes but high-node-count payload is capped before validation, so a hostile schema
+    # can't amplify it into millions of comparisons (K2)
+    reg, offered = _setup()
+    proposal = ToolCallProposal(tool="search_client", arguments={"inn": list(range(5000))})
+    out = validate_proposal(proposal, offered, reg, _GRANTED)
+    assert isinstance(out, CallRejected)
+    assert out.reason == "invalid_arguments"
+
+
 def test_unknown_tool_rejected() -> None:
     reg, offered = _setup()
     out = validate_proposal(ToolCallProposal(tool="nope", arguments={}), offered, reg, _GRANTED)

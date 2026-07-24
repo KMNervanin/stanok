@@ -7,6 +7,7 @@ every time, so a caller can never mutate registry state (AD-8, AD-9).
 """
 
 import hashlib
+import threading
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, RootModel
@@ -24,7 +25,9 @@ class ToolArgs(BaseModel):
 
     extra=forbid makes pydantic emit additionalProperties: false, which the authoring profile
     requires. Use plain types and `T | None` (no `= None`) for nullable fields; defaults and
-    default_factory are rejected so a missing argument is never silently masked."""
+    default_factory are rejected so a missing argument is never silently masked. Lists must be
+    bounded — annotate with `Field(max_length=N)` so the schema carries maxItems — and `Field(
+    pattern=...)` is rejected (regex is a ReDoS vector on the untrusted boundary)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -85,6 +88,7 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[tuple[str, int], RegisteredTool] = {}
+        self._lock = threading.Lock()
 
     def register(
         self,
@@ -97,13 +101,15 @@ class ToolRegistry:
     ) -> ToolRef:
         spec = spec_from_args(name, version, description, effect, required_permission, args_model)
         key = (spec.name, spec.version)
-        if key in self._tools:
-            raise ToolRegistryError(f"tool already registered: {key}")
         spec_json = canonical_json(spec.model_dump(mode="json"))
         digest = "sha256:" + hashlib.sha256(spec_json).hexdigest()
         entry = RegisteredTool(spec_json=spec_json, args_model=args_model, digest=digest)
         validate_tool_schema(entry.spec.input_schema)  # trust boundary on the exact stored form
-        self._tools[key] = entry
+        # check + insert must be atomic, else two concurrent registrations both pass the check.
+        with self._lock:
+            if key in self._tools:
+                raise ToolRegistryError(f"tool already registered: {key}")
+            self._tools[key] = entry
         return ToolRef(name=spec.name, version=spec.version, spec_digest=digest)
 
     def resolve(self, name: str, version: int) -> RegisteredTool | None:

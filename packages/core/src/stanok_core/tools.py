@@ -8,8 +8,9 @@ Types only. Schema validation, registry resolution and building a
 ValidatedToolCall are a separate step.
 """
 
+import json
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -36,9 +37,15 @@ Description = Annotated[str, Field(min_length=1, max_length=1000)]
 
 
 class ContractModel(BaseModel):
-    """Base for boundary contracts: no extra fields, immutable, non-finite numbers rejected."""
+    """Base for boundary contracts: no extra fields, immutable, non-finite numbers rejected.
 
-    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    hide_input_in_errors keeps offending argument values out of ValidationError *messages* (AD-7/8).
+    It does NOT scrub the `input` field of `.errors()`, so the ingress parser (Step 3) must still
+    map validation failures to value-free loc/type and never forward raw `.errors()` outward."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False, hide_input_in_errors=True
+    )
 
 
 class Effect(StrEnum):
@@ -84,12 +91,18 @@ class ToolCallProposal(ContractModel):
 class ValidatedToolCall(ContractModel):
     """Trusted call after validation. call_id and tool are server-assigned, not from the model.
 
-    frozen is not deep — real payload freezing (canonical JSON + digest) happens when this
-    object is built in the registry (next step)."""
+    The trusted payload must not change between validation and execution. pydantic `frozen` is not
+    deep, so we hold the exact canonical JSON bytes that were validated and rebuild a fresh parsed
+    copy on each `arguments` access — a caller mutating the returned dict cannot alter the snapshot,
+    and dispatch executes exactly `arguments_json`."""
 
     call_id: UUID
     tool: ToolRef
-    arguments: JsonObject
+    arguments_json: bytes
+
+    @property
+    def arguments(self) -> JsonObject:
+        return cast(JsonObject, json.loads(self.arguments_json))
 
 
 class CallRejected(ContractModel):
@@ -109,6 +122,9 @@ class ToolError(ContractModel):
 
 
 class ToolSucceeded(ContractModel):
+    # `data` is parsed from JSON as part of ExecutionOutcome, so it stays a plain object here; its
+    # canonical-bytes freezing lands with the dispatcher that first builds it (Step 3), same as
+    # ValidatedToolCall.arguments_json — no code constructs a ToolSucceeded yet.
     status: Literal["succeeded"] = "succeeded"
     call_id: UUID
     data: JsonObject

@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 from pydantic import Field, RootModel
 from stanok_core.registry import (
@@ -114,6 +116,37 @@ def test_digest_matches_digest_spec() -> None:
     reg = ToolRegistry()
     entry = reg.resolve_ref(_register(reg))
     assert entry.digest == digest_spec(entry.spec)
+
+
+def test_concurrent_registration_admits_exactly_one() -> None:
+    # V4: check + insert is atomic, so racing registrations can't both succeed
+    reg = ToolRegistry()
+    start = threading.Barrier(8)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        start.wait()
+        try:
+            ref = reg.register(
+                "search_client", 1, "Find a client", Effect.read, "customer.read", SearchArgs
+            )
+            outcome: object = ref
+        except ToolRegistryError as exc:
+            outcome = exc
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    refs = [r for r in results if isinstance(r, ToolRef)]
+    errors = [r for r in results if isinstance(r, ToolRegistryError)]
+    assert len(refs) == 1
+    assert len(errors) == 7
 
 
 def test_spec_from_args_validates_eagerly() -> None:

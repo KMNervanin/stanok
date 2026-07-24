@@ -70,3 +70,11 @@ def test_rejects_non_finite_numbers() -> None:
     # NaN/Infinity are not JSON — the untrusted boundary rejects them
     with pytest.raises(ValidationError):
         ToolCallProposal(tool="search_client", arguments={"score": float("inf")})
+
+
+def test_validation_error_message_hides_argument_values() -> None:
+    # K3: hide_input_in_errors keeps offending values out of the ValidationError message
+    secret = "LEAKED_SECRET_VALUE"
+    with pytest.raises(ValidationError) as exc:
+        ToolCallProposal(tool="search_client", arguments={}, sneaky=secret)  # type: ignore[call-arg]
+    assert secret not in str(exc.value)

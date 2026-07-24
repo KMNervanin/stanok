@@ -16,14 +16,14 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator, FormatChecker
 
 from stanok_core.registry import ToolRegistry, ToolRegistryError
-from stanok_core.schema import _ALLOWED_FORMATS, canonical_json
+from stanok_core.schema import ALLOWED_FORMATS, canonical_json
 from stanok_core.tools import CallRejected, ToolCallProposal, ToolRef, ValidatedToolCall
 
 _FORMAT_CHECKER = FormatChecker()
 
 # Fail fast: an allowed format without a real checker would silently pass (AD-8).
 # The nongpl checkers (uri, hostname, date-time, ...) require jsonschema[format-nongpl].
-_missing_checkers = frozenset(_ALLOWED_FORMATS) - set(_FORMAT_CHECKER.checkers)
+_missing_checkers = frozenset(ALLOWED_FORMATS) - set(_FORMAT_CHECKER.checkers)
 if _missing_checkers:
     raise RuntimeError(
         f"missing jsonschema format checkers {sorted(_missing_checkers)}; "
@@ -31,7 +31,30 @@ if _missing_checkers:
     )
 
 _MAX_ARGS_BYTES = 64 * 1024
+_MAX_ARGS_NODES = 1024
+_MAX_ARGS_DEPTH = 64
 _MAX_ERRORS = 3
+
+
+def _instance_too_complex(value: object) -> bool:
+    """Bound the untrusted argument tree by node count and depth before validation. Worst-case
+    validation work is (instance nodes) x (schema amplification, capped in schema.py); capping the
+    node count here is the other half, so a small-bytes payload can't be blown up by the schema
+    (K2). Iterative, so a deeply nested payload can't overflow the stack here either."""
+    count = 0
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > _MAX_ARGS_DEPTH:
+            return True
+        count += 1
+        if count > _MAX_ARGS_NODES:
+            return True
+        if isinstance(node, dict):
+            stack.extend((v, depth + 1) for v in node.values())
+        elif isinstance(node, list):
+            stack.extend((v, depth + 1) for v in node)
+    return False
 
 
 def validate_proposal(
@@ -56,6 +79,9 @@ def validate_proposal(
     if spec.required_permission not in granted_permissions:
         return CallRejected(reason="forbidden", detail="missing required permission")
 
+    if _instance_too_complex(proposal.arguments):
+        return CallRejected(reason="invalid_arguments", detail="arguments too complex")
+
     # Encode once, then validate exactly what we return (detached from the proposal).
     try:
         encoded = canonical_json(proposal.arguments)
@@ -71,4 +97,6 @@ def validate_proposal(
         paths = "; ".join("/".join(str(p) for p in e.absolute_path) or "(root)" for e in errors)
         return CallRejected(reason="invalid_arguments", detail=f"schema errors at: {paths}"[:200])
 
-    return ValidatedToolCall(call_id=uuid4(), tool=ref, arguments=snapshot)
+    # Store the exact canonical bytes we validated; ValidatedToolCall.arguments re-parses a fresh
+    # copy on read, so the trusted snapshot can't be mutated before dispatch (K1).
+    return ValidatedToolCall(call_id=uuid4(), tool=ref, arguments_json=encoded)
