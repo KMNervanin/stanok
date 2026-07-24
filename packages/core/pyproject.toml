@@ -1,0 +1,16 @@
+[project]
+name = "stanok-core"
+version = "0.0.0"
+description = "Домен Станка: workflow, tools, policy, approvals, audit. Без FastAPI и БД."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "jsonschema>=4.22",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stanok_core"]
