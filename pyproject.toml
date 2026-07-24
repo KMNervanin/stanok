@@ -14,6 +14,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["packages"]
