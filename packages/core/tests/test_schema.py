@@ -1,8 +1,10 @@
+import json
 import sys
 
 import pytest
 from stanok_core.schema import (
     ToolSchemaError,
+    _check_instance_bounds,
     canonical_json,
     digest_spec,
     validate_tool_schema,
@@ -12,7 +14,7 @@ from stanok_core.tools import Effect, JsonObject, ToolSpec
 _CLOSED: JsonObject = {
     "type": "object",
     "additionalProperties": False,
-    "properties": {"inn": {"type": "string"}},
+    "properties": {"inn": {"type": "string", "maxLength": 64}},
     "required": ["inn"],
 }
 
@@ -27,7 +29,11 @@ def test_accepts_bounded_array() -> None:
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 16}
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 64},
+                    "maxItems": 16,
+                }
             },
             "required": ["tags"],
         }
@@ -49,7 +55,14 @@ def test_accepts_anyof_of_scalars() -> None:
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"id": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+        "properties": {
+            "id": {
+                "anyOf": [
+                    {"type": "string", "maxLength": 64},
+                    {"type": "integer", "minimum": 0, "maximum": 9},
+                ]
+            }
+        },
         "required": ["id"],
     }
     validate_tool_schema(schema)
@@ -63,11 +76,17 @@ def test_accepts_anyof_of_scalars() -> None:
         {"type": ["object", "null"]},  # array-valued type
         {"required": ["x"]},  # object keywords without type
         {"additionalProperties": True},  # open object, untyped
-        {"patternProperties": {".*": {"type": "string"}}},  # defeats additionalProperties:false
+        {
+            "patternProperties": {".*": {"type": "string", "maxLength": 64}}
+        },  # defeats additionalProperties:false
         {"unevaluatedProperties": True},
-        {"allOf": [{"type": "string"}]},  # combinator not cleared for v1
-        {"oneOf": [{"type": "string"}]},  # oneOf not in v1 grammar
-        {"type": "object", "additionalProperties": False, "properties": {"y": {"type": "string"}}},
+        {"allOf": [{"type": "string", "maxLength": 64}]},  # combinator not cleared for v1
+        {"oneOf": [{"type": "string", "maxLength": 64}]},  # oneOf not in v1 grammar
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"y": {"type": "string", "maxLength": 64}},
+        },
         {"type": "array"},  # array without items = deep-open
         {"$ref": "https://evil.example/s.json"},  # remote ref
         {"$ref": "#/$defs/Missing"},  # dangling local ref
@@ -91,7 +110,10 @@ def test_rejects_optional_property() -> None:
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+        "properties": {
+            "a": {"type": "string", "maxLength": 64},
+            "b": {"type": "string", "maxLength": 64},
+        },
         "required": ["a"],
     }
     with pytest.raises(ToolSchemaError):
@@ -100,7 +122,7 @@ def test_rejects_optional_property() -> None:
 
 def test_rejects_non_object_root() -> None:
     with pytest.raises(ToolSchemaError):
-        validate_tool_schema({"type": "array", "items": {"type": "string"}})
+        validate_tool_schema({"type": "array", "items": {"type": "string", "maxLength": 64}})
 
 
 def test_rejects_embedded_dialect() -> None:
@@ -151,14 +173,14 @@ def test_rejects_unsafe_def_name() -> None:
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "$defs": {"bad/name": {"type": "string"}},
+        "$defs": {"bad/name": {"type": "string", "maxLength": 64}},
     }
     with pytest.raises(ToolSchemaError):
         validate_tool_schema(schema)
 
 
 def test_rejects_too_deep_schema() -> None:
-    node: dict[str, object] = {"type": "string"}
+    node: dict[str, object] = {"type": "string", "maxLength": 64}
     for _ in range(40):
         node = {
             "type": "object",
@@ -198,7 +220,7 @@ def test_rejects_array_without_maxitems() -> None:
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"x": {"type": "array", "items": {"type": "string"}}},
+        "properties": {"x": {"type": "array", "items": {"type": "string", "maxLength": 64}}},
         "required": ["x"],
     }
     with pytest.raises(ToolSchemaError):
@@ -210,11 +232,15 @@ def test_rejects_array_maxitems_over_limit() -> None:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "x": {"type": "array", "items": {"type": "string"}, "maxItems": 10_000_000}
+            "x": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": 64},
+                "maxItems": 10_000_000,
+            }
         },
         "required": ["x"],
     }
-    with pytest.raises(ToolSchemaError):
+    with pytest.raises(ToolSchemaError, match="must set maxItems"):
         validate_tool_schema(schema)
 
 
@@ -223,7 +249,7 @@ def test_rejects_anyof_ref_fanout() -> None:
     defs: dict[str, object] = {}
     for i in range(18):
         defs[f"L{i}"] = {"anyOf": [{"$ref": f"#/$defs/L{i + 1}"}, {"$ref": f"#/$defs/L{i + 1}"}]}
-    defs["L18"] = {"type": "integer"}
+    defs["L18"] = {"type": "integer", "minimum": 0, "maximum": 9}
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -231,7 +257,7 @@ def test_rejects_anyof_ref_fanout() -> None:
         "required": ["x"],
         "$defs": defs,
     }
-    with pytest.raises(ToolSchemaError):
+    with pytest.raises(ToolSchemaError, match="would enter more than"):
         validate_tool_schema(schema)
 
 
@@ -266,7 +292,7 @@ def test_rejects_deep_shared_tail_chain() -> None:
         "required": ["a"],
         "$defs": defs,
     }
-    with pytest.raises(ToolSchemaError):
+    with pytest.raises(ToolSchemaError, match="expanded validation depth"):
         validate_tool_schema(schema)
 
 
@@ -281,7 +307,7 @@ def test_long_ref_chain_rejected_without_recursionerror() -> None:
             "properties": {"n": {"$ref": f"#/$defs/D{i + 1}"}},
             "required": ["n"],
         }
-    defs["D100"] = {"type": "integer"}
+    defs["D100"] = {"type": "integer", "minimum": 0, "maximum": 9}
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -301,7 +327,7 @@ def test_long_ref_chain_rejected_without_recursionerror() -> None:
 def test_very_deep_schema_rejected_not_recursionerror() -> None:
     # preflight bounds depth iteratively before serialization, so this is ToolSchemaError, never a
     # leaked RecursionError (V2)
-    node: dict[str, object] = {"type": "string"}
+    node: dict[str, object] = {"type": "string", "maxLength": 64}
     for _ in range(200):
         node = {
             "type": "object",
@@ -314,16 +340,16 @@ def test_very_deep_schema_rejected_not_recursionerror() -> None:
 
 
 def test_rejects_overlong_array_anyof_amplification() -> None:
-    # in-limit schema, but items=anyOf of hundreds of branches amplifies work on an overlong array
+    # in-limit schema, but every one of the branches is tried against every one of the elements
     branches = [{"type": "string", "const": f"v{i}"} for i in range(280)]
-    items = {"anyOf": [*branches, {"type": "integer"}]}
+    items = {"anyOf": [*branches, {"type": "integer", "minimum": 0, "maximum": 9}]}
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"xs": {"type": "array", "maxItems": 1, "items": items}},
+        "properties": {"xs": {"type": "array", "maxItems": 4094, "items": items}},
         "required": ["xs"],
     }
-    with pytest.raises(ToolSchemaError):
+    with pytest.raises(ToolSchemaError, match="would enter more than"):
         validate_tool_schema(schema)
 
 
@@ -335,14 +361,14 @@ def test_rejects_uniqueitems() -> None:
         "properties": {
             "xs": {
                 "type": "array",
-                "maxItems": 4096,
+                "maxItems": 4094,
                 "uniqueItems": True,
-                "items": {"type": "integer"},
+                "items": {"type": "integer", "minimum": 0, "maximum": 9},
             }
         },
         "required": ["xs"],
     }
-    with pytest.raises(ToolSchemaError):
+    with pytest.raises(ToolSchemaError, match="uniqueItems"):
         validate_tool_schema(schema)
 
 
@@ -354,48 +380,57 @@ def test_rejects_large_enum_under_array() -> None:
         "properties": {
             "xs": {
                 "type": "array",
-                "maxItems": 4096,
+                "maxItems": 4094,
                 "items": {"type": "string", "enum": [f"v{i}" for i in range(900)]},
             }
         },
         "required": ["xs"],
     }
-    with pytest.raises(ToolSchemaError):
+    with pytest.raises(ToolSchemaError, match="would take more than"):
         validate_tool_schema(schema)
 
 
 def test_rejects_wide_object_reused_under_anyof() -> None:
     # empty {} still triggers every `required` check; anyOf over a wide object multiplies that per
     # array element even though each branch and the payload stay within the node limits
-    wide_props: dict[str, object] = {f"p{i}": {"type": "integer"} for i in range(280)}
+    wide_props: dict[str, object] = {
+        f"p{i}": {"type": "integer", "minimum": 0, "maximum": 9} for i in range(100)
+    }
     wide = {
         "type": "object",
         "additionalProperties": False,
         "properties": wide_props,
         "required": list(wide_props),
     }
-    items = {"anyOf": [{"$ref": "#/$defs/Wide"} for _ in range(30)] + [{"type": "integer"}]}
+    items = {
+        "anyOf": [{"$ref": "#/$defs/Wide"} for _ in range(30)]
+        + [{"type": "integer", "minimum": 0, "maximum": 9}]
+    }
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"xs": {"type": "array", "maxItems": 4096, "items": items}},
+        "properties": {"xs": {"type": "array", "maxItems": 4094, "items": items}},
         "required": ["xs"],
         "$defs": {"Wide": wide},
     }
-    with pytest.raises(ToolSchemaError):
+    with pytest.raises(ToolSchemaError, match="would enter more than"):
         validate_tool_schema(schema)
 
 
 def test_rejects_wrapped_anyof_expanded_depth() -> None:
-    # each def wraps the next ref in singleton anyOf; ref depth stays small but the validator would
-    # descend ~300 nested anyOf levels — bounded by expanded validation depth
+    # each def wraps the next ref in singleton anyOf; ref depth stays small, but every wrapper is
+    # one more descent charged against the same argument node, so they add up and are refused
     defs: dict[str, object] = {}
     for c in range(30):
-        inner: object = {"$ref": f"#/$defs/D{c + 1}"} if c < 29 else {"type": "integer"}
+        inner: object = (
+            {"$ref": f"#/$defs/D{c + 1}"}
+            if c < 29
+            else {"type": "integer", "minimum": 0, "maximum": 9}
+        )
         for _ in range(10):
             inner = {"anyOf": [inner]}
         defs[f"D{c}"] = inner
-    defs["D30"] = {"type": "integer"}
+    defs["D30"] = {"type": "integer", "minimum": 0, "maximum": 9}
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -403,7 +438,7 @@ def test_rejects_wrapped_anyof_expanded_depth() -> None:
         "required": ["a"],
         "$defs": defs,
     }
-    with pytest.raises(ToolSchemaError):
+    with pytest.raises(ToolSchemaError, match="expanded validation depth"):
         validate_tool_schema(schema)
 
 
@@ -418,7 +453,7 @@ def test_accepts_reused_ref_when_not_nested() -> None:
             "c": {"$ref": "#/$defs/Id"},
         },
         "required": ["a", "b", "c"],
-        "$defs": {"Id": {"type": "string"}},
+        "$defs": {"Id": {"type": "string", "maxLength": 64}},
     }
     validate_tool_schema(schema)
 
@@ -447,3 +482,183 @@ def test_digest_changes_with_content() -> None:
 
 def test_canonical_json_sorts_keys() -> None:
     assert canonical_json({"b": 1, "a": 2}) == b'{"a":2,"b":1}'
+
+
+def test_rejects_unbounded_string() -> None:
+    # a string with no maxLength/enum/const has no largest accepted value, so the schema could
+    # publish a contract whose calls never fit the byte budget - the same reasoning as maxItems (V1)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"note": {"type": "string"}},
+        "required": ["note"],
+    }
+    with pytest.raises(ToolSchemaError, match="larger than 65536 bytes"):
+        validate_tool_schema(schema)
+
+
+def test_accepts_string_bounded_by_enum_without_maxlength() -> None:
+    # enum and const bound the value just as well as maxLength does
+    validate_tool_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "stage": {"type": "string", "enum": ["new", "won", "lost"]},
+                "kind": {"type": "string", "const": "deal"},
+            },
+            "required": ["stage", "kind"],
+        }
+    )
+
+
+def test_rejects_schema_whose_largest_call_exceeds_the_byte_budget() -> None:
+    # every element is bounded and the node count fits, but 4094 x 36 chars cannot be delivered:
+    # the menu would advertise maxItems the runtime always refuses
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "ids": {
+                "type": "array",
+                "maxItems": 4094,
+                "items": {"type": "string", "format": "uuid", "maxLength": 36},
+            }
+        },
+        "required": ["ids"],
+    }
+    with pytest.raises(ToolSchemaError, match="larger than 65536 bytes"):
+        validate_tool_schema(schema)
+
+
+def test_accepts_the_same_array_once_it_fits_the_byte_budget() -> None:
+    validate_tool_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "maxItems": 290,
+                    "items": {"type": "string", "format": "uuid", "maxLength": 36},
+                }
+            },
+            "required": ["ids"],
+        }
+    )
+
+
+def test_rejects_expanded_depth_even_when_each_node_is_cheap() -> None:
+    # a $ref/object chain costs only two descents per argument node however long it gets, so nothing
+    # but the expanded-depth bound stands between it and a RecursionError inside jsonschema
+    defs: dict[str, object] = {"C40": {"type": "integer", "minimum": 0, "maximum": 9}}
+    for i in range(40):
+        defs[f"C{i}"] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"n": {"$ref": f"#/$defs/C{i + 1}"}},
+            "required": ["n"],
+        }
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"a": {"$ref": "#/$defs/C0"}},
+        "required": ["a"],
+        "$defs": defs,
+    }
+    with pytest.raises(ToolSchemaError, match="expanded validation depth"):
+        validate_tool_schema(schema)
+
+
+def test_rejects_ref_chain_that_multiplies_descents_per_element() -> None:
+    # Found by review: amplification used to count only anyOf branches, so a chain of $ref hops -
+    # each of which is a real descent charged against the same argument node - slipped through and a
+    # fully valid document then ran out of runtime budget (a B1 recurrence, via the other counter)
+    defs: dict[str, object] = {"D15": {"type": "integer", "minimum": 0, "maximum": 0}}
+    for i in range(15):
+        defs[f"D{i}"] = {"$ref": f"#/$defs/D{i + 1}"}
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "a": {
+                "type": "array",
+                "maxItems": 4094,
+                "items": {"anyOf": [{"$ref": "#/$defs/D0"}]},
+            }
+        },
+        "required": ["a"],
+        "$defs": defs,
+    }
+    with pytest.raises(ToolSchemaError, match="would enter more than"):
+        validate_tool_schema(schema)
+
+
+def test_accepts_a_deep_ref_chain_that_stays_cheap_per_node() -> None:
+    # the same shape without the array: nesting alone must not be mistaken for per-node work
+    defs: dict[str, object] = {"D15": {"type": "integer", "minimum": 0, "maximum": 0}}
+    for i in range(15):
+        defs[f"D{i}"] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"n": {"$ref": f"#/$defs/D{i + 1}"}},
+            "required": ["n"],
+        }
+    validate_tool_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"a": {"$ref": "#/$defs/D0"}},
+            "required": ["a"],
+            "$defs": defs,
+        }
+    )
+
+
+def test_rejects_branches_that_walk_a_longer_sibling_array() -> None:
+    # A branch is run against the value the MATCHING branch produced. jsonschema walks every element
+    # before maxItems can reject it, so the short branch pays for the long value, not for its own
+    # declaration. Only reproducible in stored key order, where "items" sorts before "maxItems".
+    item = {"anyOf": [{"type": "integer", "minimum": i, "maximum": i} for i in range(16)]}
+    schema = json.loads(
+        canonical_json(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "a": {
+                        "anyOf": [
+                            {"type": "array", "maxItems": 1, "items": item},
+                            {"type": "array", "maxItems": 4094, "items": item},
+                        ]
+                    }
+                },
+                "required": ["a"],
+            }
+        )
+    )
+    with pytest.raises(ToolSchemaError, match="would enter more than"):
+        validate_tool_schema(schema)
+
+
+def test_charges_a_branch_for_a_wider_siblings_keys() -> None:
+    # same mechanism on objects: the narrow branch's additionalProperties scan walks the keys of
+    # whatever value the wide branch accepts, so it must be charged for that width
+    narrow = {"type": "object", "additionalProperties": False, "properties": {}, "required": []}
+    wide_props = {f"p{i}": {"type": "integer", "minimum": 0, "maximum": 9} for i in range(40)}
+    wide = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": wide_props,
+        "required": list(wide_props),
+    }
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"u": {"anyOf": [narrow, wide]}},
+        "required": ["u"],
+    }
+    validate_tool_schema(schema)  # cheap enough to accept - but it must be charged honestly
+    bounds = _check_instance_bounds(schema, {})
+    # the narrow branch alone would score ~0; both branches scan the 40-key value
+    assert bounds.steps >= 2 * len(wide_props)

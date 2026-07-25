@@ -13,9 +13,9 @@ boundary behaviours the runner must enforce (forbidden, unknown tool, invalid/ga
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import JsonValue
+from pydantic import Field, JsonValue
 from stanok_core.registry import ToolArgs, ToolRegistry
 from stanok_core.tools import Effect, JsonObject, ToolRef
 
@@ -25,33 +25,33 @@ from stanok_conformance.backend import RawResponse
 
 
 class SearchClientArgs(ToolArgs):
-    inn: str
+    inn: str = Field(max_length=12)
 
 
 class SearchDealsArgs(ToolArgs):
-    query: str
+    query: str = Field(max_length=200)
 
 
 class GetDealArgs(ToolArgs):
-    deal_id: str
+    deal_id: str = Field(max_length=64)
 
 
 class ListCompanyTasksArgs(ToolArgs):
-    company_id: str
+    company_id: str = Field(max_length=64)
 
 
 class GetCompanyFilesArgs(ToolArgs):
-    company_id: str
+    company_id: str = Field(max_length=64)
 
 
 class CreateTaskArgs(ToolArgs):
-    company_id: str
-    title: str
+    company_id: str = Field(max_length=64)
+    title: str = Field(max_length=200)
 
 
 class FilterDealsArgs(ToolArgs):
     stage: Literal["new", "won", "lost"]  # enum
-    min_amount: int | None  # nullable -> anyOf[int, null]
+    min_amount: Annotated[int, Field(ge=0, le=10**9)] | None  # nullable -> anyOf
 
 
 _TOOLS: tuple[tuple[str, int, str, Effect, str, type[ToolArgs]], ...] = (

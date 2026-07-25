@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError as JsonSchemaError
@@ -44,23 +44,40 @@ _KEYWORDS_BY_TYPE: dict[str, frozenset[str]] = {
     "array": frozenset({"items", "minItems", "maxItems"}),
 }
 
+# Every keyword the profile can let through, so matcher.py can prove it meters each one that
+# descends into a subschema.
+ALLOWED_KEYWORDS = (
+    frozenset({"type", "$ref", "anyOf", "$defs"})
+    | _ANNOTATIONS
+    | frozenset().union(*_KEYWORDS_BY_TYPE.values())
+)
+
 _DEF_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
 _REF_RE = re.compile(r"#/\$defs/([A-Za-z_][A-Za-z0-9_.-]*)\Z")
 _MAX_DEPTH = 32
 _MAX_NODES = 1000
 _MAX_BYTES = 128 * 1024
-_MAX_ARRAY_ITEMS = 4096
-# Validation work has two bounds. (1) Cost of validating ONE maximally-failing value, per node: a
-# scalar is 1 (+ enum length), an object is 1 + its required count + the sum of its properties (all
-# `required` keys are checked even against an empty object), an array is 1 + its item cost, an
-# `anyOf` is the sum over its branches (so a wide object reused via `$ref` under `anyOf` adds up),
-# a `$ref` is its target. Capped by _MAX_SCHEMA_COST. (2) An array's items are validated once per
-# element and the element count is attacker-controlled up to the instance-node cap (validation.py),
-# so each array's item cost is separately capped by _MAX_ARRAY_ITEM_AMP. Expanded depth caps every
-# nesting level so a deep/wrapped schema can't drive deep recursion. All three want a real benchmark
-# before they are treated as final.
-_MAX_SCHEMA_COST = 8192
-_MAX_ARRAY_ITEM_AMP = 64
+# Normative limits of the boundary. They are enforced twice, from both ends: matcher.py measures the
+# real work of a call against them, and a schema is accepted here only if its own worst case fits
+# inside them. That second half is what keeps the published contract executable - a schema-valid
+# call can never be turned away for exceeding a limit its own schema was allowed to promise (B1).
+MAX_INSTANCE_NODES = 4096  # largest argument tree accepted, at registration and at runtime
+MAX_INSTANCE_BYTES = 64 * 1024  # largest canonical encoding of an argument tree
+# The two runtime budgets, calibrated by measurement rather than derived from a per-node figure -
+# an earlier version defined them as MAX_INSTANCE_NODES x a per-node cost, which is not an upper
+# bound at all (see _Bounds). A descent costs ~5 us, since it builds a sub-validator; the bulk
+# scans that `steps` counts run in C and cost ~0.04 us each. So descents are what bounds wall time:
+# 65536 of them is ~0.33 s, and the step budget adds ~40 ms on top. Both were measured on
+# pydantic 2.13.4 / jsonschema 4.26.0 and want re-measuring if either is upgraded.
+MAX_DESCENTS = 65_536
+MAX_VALIDATION_STEPS = 1_048_576
+
+# Upper bound on one code point in canonical JSON: 4 bytes of UTF-8, or 6 for a \uXXXX escape.
+_BYTES_PER_CHAR = 6
+# Room for a float's mantissa: canonical JSON writes repr(float), never longer than this.
+_FLOAT_BYTES = 24
+
+_MAX_ARRAY_ITEMS = MAX_INSTANCE_NODES - 2  # leaves room for the root object and the array itself
 _MAX_EXPANDED_DEPTH = 64
 
 
@@ -105,7 +122,7 @@ def validate_tool_schema(schema: Mapping[str, Any]) -> None:
         _check_node(sub, f"$.$defs.{name}", def_names)
     if raw_defs:
         _check_no_ref_cycles(raw_defs)
-    _check_validation_budget(schema, raw_defs if isinstance(raw_defs, Mapping) else {})
+    _check_instance_bounds(schema, raw_defs if isinstance(raw_defs, Mapping) else {})
 
 
 def _preflight_complexity(schema: Any) -> None:
@@ -162,9 +179,7 @@ def _check_node(node: Any, path: str, def_names: set[str], *, at_root: bool = Fa
         max_items = node.get("maxItems")
         # An array without maxItems is not bounded (V1); type() excludes bool (a subclass of int).
         if type(max_items) is not int or not 0 <= max_items <= _MAX_ARRAY_ITEMS:
-            raise ToolSchemaError(
-                f"{path}: array must set maxItems in [0, {_MAX_ARRAY_ITEMS}]"
-            )
+            raise ToolSchemaError(f"{path}: array must set maxItems in [0, {_MAX_ARRAY_ITEMS}]")
         _check_node(items, f"{path}.items", def_names)
 
 
@@ -274,18 +289,66 @@ def _collect_refs(node: Any, acc: set[str]) -> None:
             _collect_refs(value, acc)
 
 
-def _sat(x: int) -> int:
-    """Saturating clamp so exponential worst cases don't grow unbounded before we reject them."""
-    return x if x < _MAX_SCHEMA_COST else _MAX_SCHEMA_COST
+def _sat(value: int, ceiling: int) -> int:
+    """Clamp one past the ceiling: exact below it, always rejected at or above it. Keeps an
+    exponential worst case from growing unbounded before we refuse the schema."""
+    return value if value <= ceiling else ceiling + 1
 
 
-def _enforce_budget(depth: int, cost: int) -> None:
-    if depth > _MAX_EXPANDED_DEPTH:
+class _Bounds(NamedTuple):
+    """What one subschema can demand of the validator.
+
+    `steps` and `descents` are TOTALS: the whole amount matcher.py charges while checking the
+    largest document this subschema accepts, counted the same way it charges. They are not per-node
+    figures. An earlier version propagated a per-node maximum and multiplied it by the node budget;
+    that is not an upper bound, because `anyOf` branches sharing a child re-validate that child once
+    per branch, so a node nested under L levels of B-way union is visited B**L times. Measured:
+    B=6, L=6 charges 494550 steps on a 91-byte document while the per-node view scored it at 37."""
+
+    nodes: int
+    size: int
+    steps: int
+    descents: int
+    depth: int
+    keys: int  # widest object a value here can be, for the additionalProperties scan
+    items: int  # longest array a value here can be, for the per-element walk
+
+
+# Used where a subschema is unusable or unreachable, so any such path fails closed.
+_UNSATISFIABLE = _Bounds(
+    nodes=MAX_INSTANCE_NODES + 1,
+    size=MAX_INSTANCE_BYTES + 1,
+    steps=MAX_VALIDATION_STEPS + 1,
+    descents=MAX_DESCENTS + 1,
+    depth=0,
+    keys=0,
+    items=0,
+)
+
+
+def _enforce_bounds(bounds: _Bounds) -> None:
+    if bounds.depth > _MAX_EXPANDED_DEPTH:
         raise ToolSchemaError(f"$: expanded validation depth too deep (> {_MAX_EXPANDED_DEPTH})")
-    if cost >= _MAX_SCHEMA_COST:
+    if bounds.descents > MAX_DESCENTS:
         raise ToolSchemaError(
-            f"$: single-value validation cost too high (>= {_MAX_SCHEMA_COST}); "
-            "reduce anyOf fan-out, $ref reuse, object width, or nesting"
+            f"$: validating one call would enter more than {MAX_DESCENTS} subschemas; "
+            "narrow the unions, shorten $ref chains, or lower maxItems"
+        )
+    if bounds.steps > MAX_VALIDATION_STEPS:
+        raise ToolSchemaError(
+            f"$: validating one call would take more than {MAX_VALIDATION_STEPS} steps; "
+            "reduce nested unions, object width, enum length, or maxItems"
+        )
+    if bounds.nodes > MAX_INSTANCE_NODES:
+        raise ToolSchemaError(
+            f"$: schema admits arguments larger than {MAX_INSTANCE_NODES} nodes; "
+            "lower maxItems or drop fields, so every schema-valid call stays executable"
+        )
+    if bounds.size > MAX_INSTANCE_BYTES:
+        raise ToolSchemaError(
+            f"$: schema admits arguments larger than {MAX_INSTANCE_BYTES} bytes; "
+            "bound every string with maxLength (or enum/const) and every number with "
+            "minimum and maximum, and lower maxItems, so every schema-valid call stays executable"
         )
 
 
@@ -320,76 +383,205 @@ def _defs_reverse_topo(raw_defs: Mapping[str, Any]) -> list[str]:
     return order
 
 
-def _check_validation_budget(schema: Mapping[str, Any], raw_defs: Mapping[str, Any]) -> None:
-    """Bound the single-value validation cost and the expanded validation depth (K2).
+def _check_instance_bounds(schema: Mapping[str, Any], raw_defs: Mapping[str, Any]) -> _Bounds:
+    """Bound what a schema can demand of the validator - by totalling it, not estimating (K2b/B1).
 
-    Cost is the number of subschema checks jsonschema runs to validate ONE maximally-failing value:
-    a scalar enum re-checks up to len(enum) values; an object checks every `required` key (even
-    against `{}`) and descends into every property; an `anyOf` validates every branch in full (so a
-    wide object reused via `$ref` under `anyOf` adds up); an array is its item cost. Capping the
-    root's cost stops a small payload from forcing one huge validation. Separately, an array's items
-    are validated once per element and the element count is attacker-controlled up to the instance
-    cap (validation.py), so each array's item cost is bounded by _MAX_ARRAY_ITEM_AMP; together with
-    that cap, an array of N elements can cost at most N x _MAX_ARRAY_ITEM_AMP. Expanded depth counts
-    every nesting level (object/array/anyOf/$ref) so a long chain or deeply wrapped ref is refused.
+    Two earlier versions of this pass scored a PER-NODE figure and multiplied it by the node budget.
+    Both were wrong in the same way: the multiplier is not the node count. `anyOf` branches that
+    share a child re-check that child once per branch, so nesting L levels of B-way union makes one
+    deep node cost B**L, which no per-node figure can express. This version instead adds up exactly
+    what matcher.py charges, mirroring it keyword for keyword, and each quantity is a real total:
 
-    $defs are evaluated leaves-first (reverse topological order) so a `$ref` is a memo lookup, never
-    a recursive descent into another def: node_measure then recurses only through inline structure,
-    already capped at _MAX_DEPTH, so this pass can't itself raise RecursionError on a long chain.
+    * nodes, size - the largest argument tree the schema can ACCEPT, in nodes and in canonical
+      bytes. Every object is closed with all properties required, every array carries maxItems and
+      every scalar is bounded, so both are exact. Requiring them to fit the runtime caps is what
+      keeps the contract published to the model executable: a schema-valid call can no longer be
+      refused for exceeding a limit its own schema was allowed to promise (B1).
+    * steps, descents - the work of validating that largest accepted document. `own` is what this
+      keyword charges once; children add their own totals, an array multiplies its items by
+      maxItems, and an anyOf ADDS UP its branches because each is tried against the same value.
+      Requiring these to fit the runtime budgets is the other half of the same guarantee, and the
+      budgets are calibrated from measurement (see MAX_VALIDATION_STEPS).
+    * depth - nesting once $refs are followed, so a long chain cannot drive jsonschema's reference
+      resolution into a RecursionError.
+
+    $defs are measured leaves-first (reverse topological order) so a `$ref` is a memo lookup, never
+    a recursive descent into another def: measure() then recurses only through inline structure,
+    already capped at _MAX_DEPTH, so this pass cannot itself raise RecursionError on a long chain.
     """
-    cost_memo: dict[str, int] = {}
-    depth_memo: dict[str, int] = {}
+    memo: dict[str, _Bounds] = {}
+    # widest object and longest array anywhere inside each def, refs expanded
+    reach: dict[str, tuple[int, int]] = {}
 
-    def node_measure(node: Mapping[str, Any]) -> tuple[int, int]:
-        """Return (single-value validation cost, expanded_depth) for one node."""
+    def widest(node: Mapping[str, Any], of_arrays: bool) -> int:
+        """Largest value any subschema in here accepts: keys of an object, or length of an array.
+
+        A branch of an anyOf is run against the value the MATCHING branch produced, not against one
+        of its own - so it scans that value's keys and walks that value's elements, however narrow
+        its own declaration is. The document is globally valid, so the value at a position is
+        bounded by whatever sibling accepts it, which is what this returns."""
         ref = node.get("$ref")
         if isinstance(ref, str):
             match = _REF_RE.fullmatch(ref)
-            if match is None:
-                return 1, 1
-            name = match.group(1)
-            return cost_memo.get(name, 1), depth_memo.get(name, 0) + 1
+            if match is None or match.group(1) not in reach:
+                return 0
+            return reach[match.group(1)][1 if of_arrays else 0]
         branches = node.get("anyOf")
         if isinstance(branches, list):
-            cost, max_d = 1, 0
-            for branch in branches:
-                if isinstance(branch, Mapping):
-                    c, d = node_measure(branch)
-                    cost, max_d = _sat(cost + c), max(max_d, d)
-            return cost, max_d + 1
+            per_branch = (widest(b, of_arrays) for b in branches if isinstance(b, Mapping))
+            return max(per_branch, default=0)
         node_type = node.get("type")
         if node_type == "object":
             props = node.get("properties", {})
-            required = node.get("required", [])
-            cost = 1 + (len(required) if isinstance(required, list) else 0)
-            max_d = 0
-            if isinstance(props, Mapping):
-                for sub in props.values():
-                    if isinstance(sub, Mapping):
-                        c, d = node_measure(sub)
-                        cost, max_d = _sat(cost + c), max(max_d, d)
-            return cost, max_d + 1
+            props = props if isinstance(props, Mapping) else {}
+            inner = max(
+                (widest(v, of_arrays) for v in props.values() if isinstance(v, Mapping)), default=0
+            )
+            return inner if of_arrays else max(len(props), inner)
         if node_type == "array":
             items = node.get("items", {})
-            c, d = node_measure(items) if isinstance(items, Mapping) else (1, 0)
-            if c >= _MAX_ARRAY_ITEM_AMP:
-                # items are validated once per attacker-controlled element — cap the per-item cost
-                raise ToolSchemaError(
-                    f"$: array item too costly to validate per element (>= {_MAX_ARRAY_ITEM_AMP})"
-                )
-            return _sat(1 + c), d + 1
+            inner = widest(items, of_arrays) if isinstance(items, Mapping) else 0
+            max_items = node.get("maxItems")
+            own = max_items if type(max_items) is int else 0
+            return max(own, inner) if of_arrays else inner
+        return 0
+
+    def measure(node: Mapping[str, Any], floor_keys: int = 0, floor_items: int = 0) -> _Bounds:
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            match = _REF_RE.fullmatch(ref)
+            if match is None:  # unreachable: _check_ref ran first. Fail closed if it ever is.
+                return _UNSATISFIABLE
+            target = memo.get(match.group(1), _UNSATISFIABLE)
+            if floor_keys or floor_items:
+                # the def was measured with no envelope; under one, every object inside it scans a
+                # wider value and every array walks a longer one, so it has to be measured again
+                sub = raw_defs.get(match.group(1))
+                if isinstance(sub, Mapping):
+                    target = measure(sub, floor_keys, floor_items)
+            return _Bounds(
+                nodes=target.nodes,
+                size=target.size,
+                steps=_sat(1 + target.steps, MAX_VALIDATION_STEPS),
+                descents=_sat(1 + target.descents, MAX_DESCENTS),
+                depth=target.depth + 1,
+                keys=target.keys,
+                items=target.items,
+            )
+        branches = node.get("anyOf")
+        if isinstance(branches, list):
+            # a branch that does not match still scans additionalProperties over the value the
+            # matching branch produced, so every branch is charged for the widest value here
+            wide_keys = max(floor_keys, widest(node, of_arrays=False))
+            wide_items = max(floor_items, widest(node, of_arrays=True))
+            measured = [
+                measure(b, wide_keys, wide_items) for b in branches if isinstance(b, Mapping)
+            ]
+            # every branch is tried against the same value, so their work adds up
+            return _Bounds(
+                nodes=max((m.nodes for m in measured), default=1),
+                size=max((m.size for m in measured), default=2),
+                steps=_sat(len(measured) + sum(m.steps for m in measured), MAX_VALIDATION_STEPS),
+                descents=_sat(len(measured) + sum(m.descents for m in measured), MAX_DESCENTS),
+                depth=max((m.depth for m in measured), default=0) + 1,
+                keys=wide_keys,
+                items=wide_items,
+            )
+        node_type = node.get("type")
+        if node_type == "object":
+            props = node.get("properties", {})
+            props = props if isinstance(props, Mapping) else {}
+            required = node.get("required", [])
+            required = required if isinstance(required, list) else []
+            # charged once per visit: the additionalProperties scan over the value's keys (which
+            # equal the declared ones for an accepted value), the properties descent, and one
+            # check per required key - the last happens even when the value arrives empty
+            nodes, size = 1, 2
+            scanned = max(len(props), floor_keys)  # additionalProperties walks the value's keys
+            steps, descents, depth = len(props) + scanned + len(required), 1, 0
+            for name, sub in props.items():
+                if isinstance(sub, Mapping):
+                    m = measure(sub, floor_keys, floor_items)
+                    nodes = _sat(nodes + m.nodes, MAX_INSTANCE_NODES)
+                    # "name": value, - quotes, colon and separator around each property
+                    size = _sat(size + len(name) * _BYTES_PER_CHAR + 4 + m.size, MAX_INSTANCE_BYTES)
+                    steps = _sat(steps + m.steps, MAX_VALIDATION_STEPS)
+                    descents = _sat(descents + m.descents, MAX_DESCENTS)
+                    depth = max(depth, m.depth)
+            return _Bounds(nodes, size, steps, descents, depth + 1, len(props), 0)
+        if node_type == "array":
+            items = node.get("items", {})
+            m = (
+                measure(items, floor_keys, floor_items)
+                if isinstance(items, Mapping)
+                else _UNSATISFIABLE
+            )
+            max_items = node.get("maxItems")
+            accepted = max_items if type(max_items) is int else 0
+            # every element of the value is walked before maxItems can reject it, so a branch pays
+            # for the length the position can actually hold, not for its own declaration
+            count = max(accepted, floor_items)
+            return _Bounds(
+                nodes=_sat(1 + accepted * m.nodes, MAX_INSTANCE_NODES),
+                size=_sat(2 + accepted * (m.size + 1), MAX_INSTANCE_BYTES),
+                # the items descent is charged once per element, and so is each element's own work
+                steps=_sat(count + count * m.steps, MAX_VALIDATION_STEPS),
+                descents=_sat(1 + count * m.descents, MAX_DESCENTS),
+                depth=m.depth + 1,
+                keys=0,
+                items=accepted,
+            )
         enum = node.get("enum")
-        if isinstance(enum, list):  # a scalar enum is scanned per value
-            return _sat(1 + len(enum)), 1
-        return 1, 1  # scalar leaf
+        return _Bounds(
+            nodes=1,
+            size=_scalar_size(node, node_type),
+            steps=len(enum) if isinstance(enum, list) else 0,  # only `enum` is charged on a scalar
+            descents=0,
+            depth=1,
+            keys=0,
+            items=0,
+        )
 
     for name in _defs_reverse_topo(raw_defs):
         sub = raw_defs.get(name)
-        cost, depth = node_measure(sub) if isinstance(sub, Mapping) else (1, 1)
-        cost_memo[name], depth_memo[name] = cost, depth
-        _enforce_budget(depth, cost)
-    root_cost, root_depth = node_measure(schema)
-    _enforce_budget(root_depth, root_cost)
+        if isinstance(sub, Mapping):
+            reach[name] = (widest(sub, of_arrays=False), widest(sub, of_arrays=True))
+        memo[name] = measure(sub) if isinstance(sub, Mapping) else _UNSATISFIABLE
+        _enforce_bounds(memo[name])
+    root = measure(schema)
+    _enforce_bounds(root)
+    return root
+
+
+def _scalar_size(node: Mapping[str, Any], node_type: Any) -> int:
+    """Largest canonical encoding of a scalar the subschema accepts, saturating when unbounded."""
+    if "const" in node:
+        return _sat(len(canonical_json(node["const"])), MAX_INSTANCE_BYTES)
+    enum = node.get("enum")
+    if isinstance(enum, list) and enum:
+        return _sat(max(len(canonical_json(v)) for v in enum), MAX_INSTANCE_BYTES)
+    if node_type == "string":
+        max_length = node.get("maxLength")
+        if type(max_length) is not int:  # an unbounded string makes the schema unsatisfiable
+            return MAX_INSTANCE_BYTES + 1
+        return _sat(2 + max_length * _BYTES_PER_CHAR, MAX_INSTANCE_BYTES)
+    if node_type == "boolean":
+        return 5
+    if node_type == "null":
+        return 4
+    # A JSON number carries no length limit of its own, and `number` accepts integers too, so both
+    # ends must be pinned before its encoding can be bounded at all.
+    lower = [
+        node[k] for k in ("minimum", "exclusiveMinimum") if isinstance(node.get(k), int | float)
+    ]
+    upper = [
+        node[k] for k in ("maximum", "exclusiveMaximum") if isinstance(node.get(k), int | float)
+    ]
+    if not (lower and upper):
+        return MAX_INSTANCE_BYTES + 1
+    widest = max(len(canonical_json(v)) for v in (*lower, *upper))
+    # a float inside those bounds still needs room for its mantissa
+    return _sat(widest if node_type == "integer" else max(widest, _FLOAT_BYTES), MAX_INSTANCE_BYTES)
 
 
 def canonical_json(value: Any) -> bytes:

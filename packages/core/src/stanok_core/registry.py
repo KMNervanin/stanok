@@ -25,9 +25,14 @@ class ToolArgs(BaseModel):
 
     extra=forbid makes pydantic emit additionalProperties: false, which the authoring profile
     requires. Use plain types and `T | None` (no `= None`) for nullable fields; defaults and
-    default_factory are rejected so a missing argument is never silently masked. Lists must be
-    bounded — annotate with `Field(max_length=N)` so the schema carries maxItems — and `Field(
-    pattern=...)` is rejected (regex is a ReDoS vector on the untrusted boundary)."""
+    default_factory are rejected so a missing argument is never silently masked.
+
+    Every field must be bounded, so that the menu shown to the model promises only calls we can
+    actually execute: lists take `Field(max_length=N)` (emitted as maxItems), strings take
+    `Field(max_length=N)` unless a Literal or a constant already fixes them, and numbers take
+    `Field(ge=..., le=...)`. `Field(pattern=...)` is rejected outright - a regex is a ReDoS vector
+    on the untrusted boundary. Use `list`, not `set`/`frozenset`, which need the forbidden
+    uniqueItems."""
 
     model_config = ConfigDict(extra="forbid")
 

@@ -4,43 +4,30 @@ Order: resolve the exact offered version -> coarse authorization -> schema valid
 normalization, Step 3+). Every step fails closed. The model's tool name is bound to the exact
 ToolRef from the menu shown that turn, never 'latest'; trusted ids (call_id) are server-assigned.
 
-Rejection detail carries only JSON paths, never argument values (AD-8) - jsonschema error messages
-embed the offending values, so we take error.absolute_path only.
+Schema validation itself runs under a measured work budget and returns paths only, never argument
+values (AD-8) - see matcher.py.
 """
 
 import json
 from collections.abc import Mapping
-from itertools import islice
 from uuid import uuid4
 
-from jsonschema import Draft202012Validator, FormatChecker
-
+from stanok_core.matcher import ArgumentTooComplex, failing_paths
 from stanok_core.registry import ToolRegistry, ToolRegistryError
-from stanok_core.schema import ALLOWED_FORMATS, canonical_json
+from stanok_core.schema import MAX_INSTANCE_BYTES, MAX_INSTANCE_NODES, canonical_json
 from stanok_core.tools import CallRejected, ToolCallProposal, ToolRef, ValidatedToolCall
 
-_FORMAT_CHECKER = FormatChecker()
-
-# Fail fast: an allowed format without a real checker would silently pass (AD-8).
-# The nongpl checkers (uri, hostname, date-time, ...) require jsonschema[format-nongpl].
-_missing_checkers = frozenset(ALLOWED_FORMATS) - set(_FORMAT_CHECKER.checkers)
-if _missing_checkers:
-    raise RuntimeError(
-        f"missing jsonschema format checkers {sorted(_missing_checkers)}; "
-        "install jsonschema[format-nongpl]"
-    )
-
-_MAX_ARGS_BYTES = 64 * 1024
-_MAX_ARGS_NODES = 1024
 _MAX_ARGS_DEPTH = 64
-_MAX_ERRORS = 3
 
 
 def _instance_too_complex(value: object) -> bool:
-    """Bound the untrusted argument tree by node count and depth before validation. Worst-case
-    validation work is (instance nodes) x (schema amplification, capped in schema.py); capping the
-    node count here is the other half, so a small-bytes payload can't be blown up by the schema
-    (K2). Iterative, so a deeply nested payload can't overflow the stack here either."""
+    """Bound the untrusted argument tree by node count and depth before validation.
+
+    The work of validating a call is bounded by the budgets matcher.py meters, not by any figure
+    derived from this count - see _Bounds in schema.py for why a per-node model cannot bound it.
+    What this cap does is keep the runtime and the profile talking about the same tree: it is the
+    same MAX_INSTANCE_NODES a schema must be satisfiable within, so no schema-valid call can trip
+    it (B1). Iterative, so a deeply nested payload can't overflow the stack here either."""
     count = 0
     stack: list[tuple[object, int]] = [(value, 0)]
     while stack:
@@ -48,7 +35,7 @@ def _instance_too_complex(value: object) -> bool:
         if depth > _MAX_ARGS_DEPTH:
             return True
         count += 1
-        if count > _MAX_ARGS_NODES:
+        if count > MAX_INSTANCE_NODES:
             return True
         if isinstance(node, dict):
             stack.extend((v, depth + 1) for v in node.values())
@@ -87,15 +74,20 @@ def validate_proposal(
         encoded = canonical_json(proposal.arguments)
     except (ValueError, TypeError, RecursionError):
         return CallRejected(reason="invalid_arguments", detail="arguments not JSON-serializable")
-    if len(encoded) > _MAX_ARGS_BYTES:
+    if len(encoded) > MAX_INSTANCE_BYTES:
         return CallRejected(reason="invalid_arguments", detail="arguments too large")
     snapshot = json.loads(encoded)
 
-    validator = Draft202012Validator(dict(spec.input_schema), format_checker=_FORMAT_CHECKER)
-    errors = list(islice(validator.iter_errors(snapshot), _MAX_ERRORS))
-    if errors:
-        paths = "; ".join("/".join(str(p) for p in e.absolute_path) or "(root)" for e in errors)
-        return CallRejected(reason="invalid_arguments", detail=f"schema errors at: {paths}"[:200])
+    try:
+        paths = failing_paths(spec.input_schema, snapshot)
+    except ArgumentTooComplex:
+        # The schema was accepted only if its own worst case fits the budget, so this means a bound
+        # is wrong somewhere - refuse the call rather than keep working.
+        return CallRejected(reason="invalid_arguments", detail="arguments too complex to validate")
+    if paths:
+        return CallRejected(
+            reason="invalid_arguments", detail=f"schema errors at: {'; '.join(paths)}"[:200]
+        )
 
     # Store the exact canonical bytes we validated; ValidatedToolCall.arguments re-parses a fresh
     # copy on read, so the trusted snapshot can't be mutated before dispatch (K1).

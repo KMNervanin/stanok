@@ -14,8 +14,8 @@ from stanok_core.tools import Effect, ToolRef
 
 
 class SearchArgs(ToolArgs):
-    inn: str
-    kpp: str | None  # nullable, required, no default
+    inn: str = Field(max_length=12)
+    kpp: str | None = Field(max_length=12)  # nullable, required, no default
 
 
 def _register(reg: ToolRegistry) -> ToolRef:
@@ -153,3 +153,38 @@ def test_spec_from_args_validates_eagerly() -> None:
     spec = spec_from_args("search_client", 1, "d", Effect.read, "customer.read", SearchArgs)
     assert spec.name == "search_client"
     assert spec.input_schema["additionalProperties"] is False
+
+
+def test_wide_flat_union_registers_and_stays_cheap() -> None:
+    # This used to be refused as a K2b vector. Measured, a flat union is linear in its width: the
+    # worst hostile value costs ~126k charges (~15 ms), well inside the runtime budget. Refusing it
+    # was the old per-node model being wrong in the safe direction; what actually costs is nesting,
+    # covered by test_rejects_nested_unions_that_multiply_work in test_schema.py.
+    variants = [type(f"Z{i}", (ToolArgs,), {"__annotations__": {}}) for i in range(140)]
+    union: object = variants[0]
+    for variant in variants[1:]:
+        union = union | variant
+    wide = type("WideArgs", (ToolArgs,), {"__annotations__": {"u": union}})
+    reg = ToolRegistry()
+    ref = reg.register("wide", 1, "Wide union", Effect.read, "customer.read", wide)
+    assert reg.resolve_ref(ref).spec.name == "wide"
+
+
+def test_accepts_a_union_within_the_fan_out_limit() -> None:
+    variants = [type(f"Y{i}", (ToolArgs,), {"__annotations__": {}}) for i in range(5)]
+    union: object = variants[0]
+    for variant in variants[1:]:
+        union = union | variant
+    narrow = type("NarrowArgs", (ToolArgs,), {"__annotations__": {"u": union}})
+    ToolRegistry().register("narrow", 1, "Narrow union", Effect.read, "customer.read", narrow)
+
+
+def test_rejects_schema_that_admits_an_unexecutable_call() -> None:
+    # B1: two maximal arrays are each legal on their own, but no instance satisfying both fits the
+    # runtime budget — publishing that schema to the model would promise a call we always refuse
+    class TwoLists(ToolArgs):
+        a: list[int] = Field(max_length=4094)
+        b: list[int] = Field(max_length=4094)
+
+    with pytest.raises(ToolSchemaError, match="admits arguments larger than"):
+        ToolRegistry().register("two_lists", 1, "Two lists", Effect.read, "customer.read", TwoLists)
