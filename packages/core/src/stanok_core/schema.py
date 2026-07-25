@@ -412,6 +412,8 @@ def _check_instance_bounds(schema: Mapping[str, Any], raw_defs: Mapping[str, Any
     memo: dict[str, _Bounds] = {}
     # widest object and longest array anywhere inside each def, refs expanded
     reach: dict[str, tuple[int, int]] = {}
+    # measure() results keyed by (def, envelope), so a diamond of unions is analysed once
+    envelopes: dict[tuple[str, int, int], _Bounds] = {}
 
     def widest(node: Mapping[str, Any], of_arrays: bool) -> int:
         """Largest value any subschema in here accepts: keys of an object, or length of an array.
@@ -452,13 +454,23 @@ def _check_instance_bounds(schema: Mapping[str, Any], raw_defs: Mapping[str, Any
             match = _REF_RE.fullmatch(ref)
             if match is None:  # unreachable: _check_ref ran first. Fail closed if it ever is.
                 return _UNSATISFIABLE
-            target = memo.get(match.group(1), _UNSATISFIABLE)
+            name = match.group(1)
+            target = memo.get(name, _UNSATISFIABLE)
             if floor_keys or floor_items:
-                # the def was measured with no envelope; under one, every object inside it scans a
-                # wider value and every array walks a longer one, so it has to be measured again
-                sub = raw_defs.get(match.group(1))
-                if isinstance(sub, Mapping):
-                    target = measure(sub, floor_keys, floor_items)
+                # The def was measured with no envelope; under one, every object inside it scans a
+                # wider value and every array walks a longer one, so it has to be measured again.
+                # Cached per (def, envelope): a diamond of nested unions reaches the same def from
+                # both branches of every level, and without this the analysis itself doubles per
+                # level - measured at 1.6 s for a 5 KB schema, which the node cap does not bound.
+                # Only the analysis is shared; each branch still adds its own cost to the total.
+                cached = envelopes.get((name, floor_keys, floor_items))
+                if cached is None:
+                    sub = raw_defs.get(name)
+                    if isinstance(sub, Mapping):
+                        cached = measure(sub, floor_keys, floor_items)
+                        envelopes[name, floor_keys, floor_items] = cached
+                if cached is not None:
+                    target = cached
             return _Bounds(
                 nodes=target.nodes,
                 size=target.size,

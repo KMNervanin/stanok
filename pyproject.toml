@@ -18,4 +18,6 @@ plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["packages"]
-addopts = "-q"
+# the long fuzzing sweep is deselected by default; run it with `uv run pytest -m slow`
+addopts = "-q -m 'not slow'"
+markers = ["slow: long-running property sweeps, not part of the default run"]
