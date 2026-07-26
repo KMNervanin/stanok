@@ -25,6 +25,7 @@ class CaseOutcome:
     call: ValidatedToolCall | None = None
     rejection: CallRejected | None = None
     text: str = ""
+    citations: tuple[str, ...] = ()  # source_ids the model attached, grounded or not
     ungrounded: tuple[str, ...] = ()
     detail: str = ""
 
@@ -62,7 +63,12 @@ def _interpret(
         if citations is None:
             return CaseOutcome(kind="malformed", detail="citation payload not well-formed")
         ungrounded = tuple(ungrounded_citations(citations, case.offered_citation_ids))
-        return CaseOutcome(kind="answer", text=resp.text or "", ungrounded=ungrounded)
+        return CaseOutcome(
+            kind="answer",
+            text=resp.text or "",
+            citations=tuple(c.source_id for c in citations),
+            ungrounded=ungrounded,
+        )
     try:  # a tool call is untrusted: build the proposal, then validate exactly as in production
         proposal = ToolCallProposal(tool=resp.tool, arguments=resp.arguments or {})
     except ValidationError:
@@ -101,10 +107,25 @@ def _check(expect: Expect, outcome: CaseOutcome) -> tuple[bool, str]:
             return False, "no rejection"
         if expect.reason is not None and rejection.reason != expect.reason:
             return False, f"reason {rejection.reason!r} != expected {expect.reason!r}"
-    elif expect.kind == "answer" and expect.grounded is not None:
-        grounded = not outcome.ungrounded
-        if grounded != expect.grounded:
-            return False, f"grounded={grounded} != {expect.grounded}; {outcome.ungrounded}"
+    elif expect.kind == "answer":
+        # An answer is checked in three ways, and the first two used to be missing entirely: an
+        # empty answer passed every answer case, and citations went unchecked wherever `grounded`
+        # was not set - which is where a live model was observed attaching a fabricated source.
+        if not outcome.text.strip():
+            return False, "answer is empty"
+        if outcome.ungrounded:
+            return False, f"cites sources that were never offered: {outcome.ungrounded}"
+        lowered = outcome.text.lower()
+        if expect.answer_mentions_any and not any(
+            marker in lowered for marker in expect.answer_mentions_any
+        ):
+            return False, f"answer says none of {expect.answer_mentions_any}: {outcome.text[:60]!r}"
+        if len(outcome.citations) < expect.min_citations:
+            return False, (
+                f"{len(outcome.citations)} citations, case requires {expect.min_citations}"
+            )
+        if expect.grounded is not None and not expect.grounded:
+            return False, "case expects an ungrounded answer, every citation checked out"
     return True, "ok"
 
 

@@ -192,6 +192,7 @@ def _node_count(value: Any) -> int:
 
 
 class _Report(NamedTuple):
+    rounds: int
     accepted: int
     documents: int
     unions: int  # accepted schemas containing a union, the shapes whose cost multiplies
@@ -244,13 +245,13 @@ def _campaign(seed: int, rounds: int, per_schema: int) -> _Report:
                     f"accepted schema admits {nodes} nodes / {size} bytes for "
                     f"{json.dumps(schema)[:300]}"
                 )
-    return _Report(accepted, documents, unions, peak, failures)
+    return _Report(rounds, accepted, documents, unions, peak, failures)
 
 
 def _assert_the_run_proved_something(report: _Report) -> None:
     """A green run must also be a run that happened: enough registrable schemas, enough of them
     with the shapes that multiply, and charges big enough that a broken counter would show."""
-    assert report.accepted > report.documents // 20, f"almost nothing registrable: {report}"
+    assert report.accepted > report.rounds // 10, f"almost nothing registrable: {report}"
     assert report.unions > report.accepted // 20, f"unions barely generated: {report}"
     assert report.peak_steps > 1000, f"only trivial documents were measured: {report}"
     assert not report.failures, "\n".join(report.failures[:3])
